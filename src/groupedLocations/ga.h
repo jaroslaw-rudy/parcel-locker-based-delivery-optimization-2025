@@ -1,0 +1,236 @@
+#pragma once
+#include "../utils.h"
+#include "greedy.h"
+
+struct GLCmp {
+    std::vector<double> siw;
+
+    GLCmp(std::vector<double> & _siw): siw(_siw) {}
+
+    bool operator() (int i, int j) {
+        return (siw[i] > siw[j]);
+    }
+};
+
+class GLGAAlgorithm {
+    public:
+
+    Instance * inst;
+    std::mt19937 mtg;
+    std::vector<GLSolution> & front;
+    double timeLimit;
+    int populationSize;
+    std::vector<GLSolution> population;
+    std::vector<GLSolution> children;
+    double mutationChance;
+    double elitPercentage;
+
+    GLGAAlgorithm(Instance * _inst, long _seed, std::vector<GLSolution> & _front, double _timeLimit, int _populationSize, double _mutationChance, double _elitPercentage):
+        inst(_inst),
+        mtg(_seed),
+        front(_front),
+        timeLimit(_timeLimit),
+        populationSize(_populationSize),
+        mutationChance(_mutationChance),
+        elitPercentage(_elitPercentage)
+    {}
+
+    int run() {
+        struct timespec timep;
+	    clock_gettime(CLOCK_REALTIME, & timep);
+
+        front.clear();
+
+        createInitialPopulation();
+
+        int iter = 0;
+        while (timer(timep) < timeLimit) {
+            createChildren();
+            mutateChildren();
+            createNewPopulation();
+            iter++;
+        }
+        return iter;
+    }
+
+    void createNewPopulation() {
+        std::vector<GLSolution> newPopulation;
+        std::vector<GoalFunction> set;
+
+        int childrenPairsNeeded = (populationSize * (1.0 - elitPercentage) / 2.0 + 0.5);
+        int eliteSize = populationSize - childrenPairsNeeded * 2;
+
+        for (int i = 0; i < populationSize; ++i)
+            set.push_back(population[i].goalFunction);
+        
+        std::vector<double> siw;
+        GoalFunction::topsis2(set, siw);
+        std::vector<int> indices;
+        for (int i = 0; i < populationSize; ++i)
+            indices.push_back(i);
+        GLCmp cmp(siw);
+        std::sort(indices.begin(), indices.end(), cmp);
+
+        for (int i = 0; i < eliteSize; ++i)
+            newPopulation.push_back(population[indices[i]]);
+        for (int i = 0; i < children.size(); ++i)
+            newPopulation.push_back(children[i]);
+        population.swap(newPopulation);
+    }
+
+    void createChildren() {
+        children.clear();
+        int childrenPairsNeeded = (populationSize * (1.0 - elitPercentage) / 2.0 + 0.5);
+        while (children.size() < 2 * childrenPairsNeeded) {
+            int p1 = tournament();
+            int p2 = tournament();
+            if (p1 != p2) {
+                createChild(p1, p2);
+                createChild(p2, p1);
+            }
+        }
+    }
+
+    void createChild(int p1, int p2) {
+        std::uniform_int_distribution<int> uid(0, inst->n - 1);
+        std::uniform_int_distribution<int> uid2(0, inst->n - 2);
+        int c1 = uid(mtg);
+        int c2 = uid2(mtg);
+        if (c2 >= c1)
+            c2++;
+        else
+            std::swap(c1, c2);
+        std::map<int,int> used;
+        GLSolution child(inst);
+        int pos = 0;
+
+        GLSolution & parent1 = population[p1];
+        GLSolution & parent2 = population[p2];
+
+        for (int r = 0; r < inst->v; ++r) {
+            for (int b = 0; b < parent1.solution[r].sequence.size(); ++b) {
+                int loc = parent1.solution[r].sequence[b];
+                for (int i : parent1.solution[r].orderMap[loc]) {
+                    if (pos >= c1 && pos <= c2) {
+                        child.addOrder(i, r);
+                        used[i] = 1;
+                    }
+                    pos++;
+                }
+            }
+        }
+
+        for (int r = 0; r < inst->v; ++r) {
+            auto veh = parent2.solution[r];
+            for (int b = 0; b < veh.sequence.size(); ++b) {
+                int loc = veh.sequence[b];
+                for (int i : veh.orderMap[loc]) {
+                    if (used.count(i) == 0) {
+                        for (int s = 0; s < inst->v; ++s) {
+                            int t = (r + s) % inst->v;
+                            child.addOrder(i, t);
+                            if (child.evaluate())
+                                break;
+                            else
+                                child.removeOrder(i, t);
+                        }
+                    }
+                    used[i] = 1;
+                }
+            }
+        }
+
+        if (used.size() == inst->n)
+            children.push_back(child);
+        else
+            children.push_back(parent1);
+    }
+
+    int tournament() {
+        std::vector<GoalFunction> set;
+        std::vector<int> indices;
+        int tournamentSize = sqrt(populationSize) + 0.5;
+        std::uniform_int_distribution<int> uid(0, populationSize - 1);
+        for (int i = 0; i < tournamentSize; ++i)  {
+            int p = uid(mtg);
+            set.push_back(population[p].goalFunction);
+            indices.push_back(p);
+        }
+        int idx = GoalFunction::topsis(set);
+        return indices[idx];
+    }
+
+    void mutateChildren() {
+        std::vector<GLSolution> mutated;
+        for (int p = 0; p < children.size(); ++p) {
+            GLSolution copy = children[p];
+            applyRandomInsert(copy);
+            if (copy.evaluate()) {
+                mutated.push_back(copy);
+                GLSolution::tryAddToFront(front, copy);
+            }
+            else
+                mutated.push_back(children[p]);
+        }
+        children.swap(mutated);
+    }
+
+    void createInitialPopulation() {
+        GLGreedyAlgorithm greedy;
+        greedy.run(inst, front);
+
+        std::uniform_int_distribution<int> uid(0, front.size() - 1);
+
+        std::vector<GLSolution> pop;
+
+        int specimenSize = 0;
+        for (int r = 0; r < inst->v; ++r)
+            specimenSize += front[0].solution[r].noOfOrders;
+
+        for (int p = 0; p < populationSize; ++p) {
+            int g = uid(mtg);
+            population.push_back(front[g]);
+            pop.push_back(front[g]);
+            for (int i = 0; i < specimenSize / 10; ++i)
+                applyRandomInsert(pop[p]);
+        }
+
+        for (int p = 0; p < populationSize; ++p) {
+            if (pop[p].evaluate()) {
+                population[p] = pop[p];
+                GLSolution::tryAddToFront(front, population[p]);
+            }
+        }
+    }
+
+    void applyRandomInsert(GLSolution & specimen) {
+        std::uniform_int_distribution<int> uiv(0, inst->v - 1);
+        int r = uiv(mtg);
+        int s = uiv(mtg);
+        int b;
+        int p;
+        int p2;
+        if (specimen.solution[r].sequence.size() == 0)
+            return;
+
+        if (r != s) {
+            std::uniform_int_distribution<int> uib(0, specimen.solution[r].sequence.size() - 1);
+            b = uib(mtg);
+            int loc = specimen.solution[r].sequence[b];
+            std::uniform_int_distribution<int> uip(0, specimen.solution[r].orderMap[loc].size() - 1);
+            p = uip(mtg);
+            std::uniform_int_distribution<int> uip2(0, specimen.solution[s].noOfOrders);
+            p2 = uip2(mtg);
+
+            int order = specimen.solution[r].orderMap[loc][p];
+            specimen.removeOrder(order, r);
+            specimen.insertOrder(order, p2, s);
+        }
+        else {
+            std::uniform_int_distribution<int> uip(0, specimen.solution[r].sequence.size() - 1);
+            p = uip(mtg);
+            p2 = uip(mtg);
+            specimen.removeAndInsertBatch(p, p2, r);
+        }
+    }
+};
